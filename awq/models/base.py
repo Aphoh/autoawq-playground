@@ -11,6 +11,7 @@ from safetensors.torch import save_file
 from typing_extensions import Doc, Annotated
 from huggingface_hub import snapshot_download
 from transformers.modeling_utils import shard_checkpoint
+from pathlib import Path
 
 from awq.modules.linear import (
     WQLinear_GEMM,
@@ -165,7 +166,10 @@ class BaseAWQForCausalLM(nn.Module):
         self.quant_config: AwqConfig = AwqConfig.from_dict(quant_config)
 
         if hasattr(self, "modules_to_not_convert"):
-            self.quant_config.modules_to_not_convert = self.modules_to_not_convert
+            if self.quant_config.modules_to_not_convert is None:
+                self.quant_config.modules_to_not_convert = self.modules_to_not_convert
+            else:
+                self.quant_config.modules_to_not_convert = self.modules_to_not_convert + self.quant_config.modules_to_not_convert
 
         self.quantizer = AwqQuantizer(
             self,
@@ -436,6 +440,9 @@ class BaseAWQForCausalLM(nn.Module):
                 torch_dtype=torch_dtype,
                 trust_remote_code=trust_remote_code,
             )
+            if getattr(config, "mlp_split", False):
+                act_pcts = torch.load(str(Path(model_path) / "acts.pt") )
+                model.split_mlp(act_pcts, config.mlp_split_thresh)
 
         # Prepare WQLinear layers, replace nn.Linear
         self._load_quantized_modules(

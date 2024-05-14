@@ -7,13 +7,22 @@ from awq.modules.fused.model import LlamaLikeModel
 from transformers.models.llama.modeling_llama import (
     LlamaDecoderLayer as OldLlamaDecoderLayer,
     LlamaForCausalLM as OldLlamaForCausalLM,
+    LlamaMLP
 )
 from awq.modules.fused.norm import FasterTransformerRMSNorm
+import copy
+import torch
+from torch import nn
 
 
 class LlamaAWQForCausalLM(BaseAWQForCausalLM):
     layer_type = "LlamaDecoderLayer"
     max_seq_len_key = "max_position_embeddings"
+    modules_to_not_convert = ["mlp.mlp1"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_mlp_split = False
 
     @staticmethod
     def fuse_layers(model: OldLlamaForCausalLM):
@@ -31,6 +40,13 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
     @staticmethod
     def move_embed(model: OldLlamaForCausalLM, device: str):
         model.model.embed_tokens = model.model.embed_tokens.to(device)
+
+    def split_mlp(self, act_pcts, thresh):
+        assert not self.is_mlp_split, "MLP is already split?"
+        for i, module in enumerate(self.model.model.layers):
+            assert isinstance(module.mlp, LlamaMLP)
+            module.mlp = SplitLlamaMLP(module.mlp, act_pcts[i], thresh)
+        self.is_mlp_split = True
 
     @staticmethod
     def get_layers_for_scaling(module: OldLlamaDecoderLayer, input_feat, module_kwargs):
@@ -62,27 +78,91 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
                 )
             )
 
-        # linear 1
-        layers.append(
-            dict(
-                prev_op=module.post_attention_layernorm,
-                layers=[module.mlp.gate_proj, module.mlp.up_proj],
-                inp=input_feat["mlp.gate_proj"],
-                module2inspect=module.mlp,
+        if isinstance(module.mlp, LlamaMLP):
+            # linear 1
+            layers.append(
+                dict(
+                    prev_op=module.post_attention_layernorm,
+                    layers=[module.mlp.gate_proj, module.mlp.up_proj],
+                    inp=input_feat["mlp.gate_proj"],
+                    module2inspect=module.mlp,
+                )
             )
-        )
 
-        # linear 2
-        layers.append(
-            dict(
-                prev_op=module.mlp.up_proj,
-                layers=[module.mlp.down_proj],
-                inp=input_feat["mlp.down_proj"],
+            # linear 2
+            layers.append(
+                dict(
+                    prev_op=module.mlp.up_proj,
+                    layers=[module.mlp.down_proj],
+                    inp=input_feat["mlp.down_proj"],
+                )
             )
-        )
+        elif isinstance(module.mlp, SplitLlamaMLP):
+            # linear 1
+            layers.append(
+                dict(
+                    prev_op=module.post_attention_layernorm,
+                    layers=[module.mlp.mlp2.gate_proj, module.mlp.mlp2.up_proj],
+                    inp=input_feat["mlp.mlp2.gate_proj"],
+                    module2inspect=module.mlp.mlp2,
+                )
+            )
+
+            # linear 2
+            layers.append(
+                dict(
+                    prev_op=module.mlp.mlp2.up_proj,
+                    layers=[module.mlp.mlp2.down_proj],
+                    inp=input_feat["mlp.mlp2.down_proj"],
+                )
+            )
+        else:
+            raise ValueError(f"Unknown MLP type: {type(module.mlp)}")
 
         return layers
 
+
+class SplitLlamaMLP(nn.Module):
+    def __init__(self, mlp: LlamaMLP, act_pcts: torch.Tensor, thresh: float = 0.5):
+        super().__init__()
+        self.config = mlp.config
+        self.hidden_size = mlp.hidden_size
+        self.intermediate_size = mlp.intermediate_size
+
+        perm = torch.argsort(act_pcts, descending=True)        
+        limit = torch.argwhere(act_pcts[perm] > thresh).max()
+        limit = ((limit + 63) // 64) * 64
+        gate1_weight = mlp.gate_proj.weight[perm[:limit], :]
+        gate2_weight = mlp.gate_proj.weight[perm[limit:], :]
+        up1_weight = mlp.up_proj.weight[perm[:limit], :]
+        up2_weight = mlp.up_proj.weight[perm[limit:], :]
+        down1_weight = mlp.down_proj.weight[:, perm[:limit]]
+        down2_weight = mlp.down_proj.weight[:, perm[limit:]]
+
+        cfg1 = copy.deepcopy(mlp.config)
+        cfg1.intermediate_size = limit
+        cfg2 = copy.deepcopy(mlp.config)
+        cfg2.intermediate_size = mlp.intermediate_size - limit
+        self.mlp1 = LlamaMLP(cfg1)
+        self.mlp2 = LlamaMLP(cfg2)
+        self.mlp2.down_proj.bias = None # don't duplicate bias
+        print(self.mlp1, self.mlp2)
+
+        self.mlp1.gate_proj.weight.data.copy_(gate1_weight)
+        self.mlp2.gate_proj.weight.data.copy_(gate2_weight)
+        self.mlp1.up_proj.weight.data.copy_(up1_weight)
+        self.mlp2.up_proj.weight.data.copy_(up2_weight)
+        self.mlp1.down_proj.weight.data.copy_(down1_weight)
+        self.mlp2.down_proj.weight.data.copy_(down2_weight)
+        if mlp.gate_proj.bias is not None:
+            self.mlp1.gate_proj.bias.data.copy_(mlp.gate_proj.bias[perm[:limit]])
+            self.mlp2.gate_proj.bias.data.copy_(mlp.gate_proj.bias[perm[limit:]])
+            self.mlp1.up_proj.bias.data.copy_(mlp.up_proj.bias[perm[:limit]])
+            self.mlp2.up_proj.bias.data.copy_(mlp.up_proj.bias[perm[limit:]])
+            self.mlp1.down_proj.bias.data.copy_(mlp.down_proj.bias)
+
+    def forward(self, x):
+        return self.mlp1(x) + self.mlp2(x)
 
 class LlamaFuser:
     def __init__(self, model: OldLlamaForCausalLM):
