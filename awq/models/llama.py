@@ -14,6 +14,11 @@ import copy
 import torch
 from torch import nn
 
+def set_skip_quant(a):
+    setattr(a, "skip_quant", True)
+    for m in a.modules():
+        if isinstance(m, nn.Linear):
+            setattr(m, "skip_quant", True)
 
 class LlamaAWQForCausalLM(BaseAWQForCausalLM):
     layer_type = "LlamaDecoderLayer"
@@ -45,7 +50,17 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
         assert not self.is_mlp_split, "MLP is already split?"
         for i, module in enumerate(self.model.model.layers):
             assert isinstance(module.mlp, LlamaMLP)
-            module.mlp = SplitLlamaMLP(module.mlp, act_pcts[i], thresh)
+            num_past = (act_pcts[i] > thresh).sum()
+            #num_past = module.mlp.intermediate_size
+            #num_past = module.mlp.intermediate_size // 2
+            if num_past > module.mlp.intermediate_size - 64:
+                print(f"Skipping quantization of mlp layer {i}")
+                set_skip_quant(module.mlp)
+            elif num_past < 64:
+                print(f"Fully quantizing mlp layer {i}")
+            else:
+                print(f"Quantizing ~{num_past} channels from mlp layer {i}")
+                module.mlp = SplitLlamaMLP(module.mlp, act_pcts[i], thresh)
         self.is_mlp_split = True
 
     @staticmethod
@@ -78,7 +93,7 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
                 )
             )
 
-        if isinstance(module.mlp, LlamaMLP):
+        if isinstance(module.mlp, LlamaMLP) and not getattr(module.mlp, "skip_quant", False):
             # linear 1
             layers.append(
                 dict(
@@ -116,8 +131,6 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
                     inp=input_feat["mlp.mlp2.down_proj"],
                 )
             )
-        else:
-            raise ValueError(f"Unknown MLP type: {type(module.mlp)}")
 
         return layers
 
@@ -130,8 +143,12 @@ class SplitLlamaMLP(nn.Module):
         self.intermediate_size = mlp.intermediate_size
 
         perm = torch.argsort(act_pcts, descending=True)        
+        #perm = torch.randperm(self.intermediate_size)
         limit = torch.argwhere(act_pcts[perm] > thresh).max()
+        limit = min(max(limit, 64), self.intermediate_size - 64)
+        #limit = self.intermediate_size // 2
         limit = ((limit + 63) // 64) * 64
+
         gate1_weight = mlp.gate_proj.weight[perm[:limit], :]
         gate2_weight = mlp.gate_proj.weight[perm[limit:], :]
         up1_weight = mlp.up_proj.weight[perm[:limit], :]
@@ -143,8 +160,8 @@ class SplitLlamaMLP(nn.Module):
         cfg1.intermediate_size = limit
         cfg2 = copy.deepcopy(mlp.config)
         cfg2.intermediate_size = mlp.intermediate_size - limit
-        self.mlp1 = LlamaMLP(cfg1)
-        self.mlp2 = LlamaMLP(cfg2)
+        self.mlp1 = LlamaMLP(cfg1).to(device=gate1_weight.device, dtype=gate1_weight.dtype)
+        self.mlp2 = LlamaMLP(cfg2).to(device=gate2_weight.device, dtype=gate2_weight.dtype)
         self.mlp2.down_proj.bias = None # don't duplicate bias
         print(self.mlp1, self.mlp2)
 
