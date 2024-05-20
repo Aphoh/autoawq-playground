@@ -117,6 +117,7 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
             layers.append(
                 dict(
                     prev_op=module.post_attention_layernorm,
+                    unscale_ops=[module.mlp.mlp1.gate_proj, module.mlp.mlp1.up_proj],
                     layers=[module.mlp.mlp2.gate_proj, module.mlp.mlp2.up_proj],
                     inp=input_feat["mlp.mlp2.gate_proj"],
                     module2inspect=module.mlp.mlp2,

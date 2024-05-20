@@ -239,6 +239,7 @@ class AwqQuantizer:
         inp: torch.Tensor,
         module2inspect=None,
         kwargs={},
+        unscale_ops=[],
     ):
         if module2inspect is None:
             assert len(layers) == 1
@@ -285,6 +286,7 @@ class AwqQuantizer:
             get_op_name(module, prev_op),
             tuple([get_op_name(module, m) for m in layers]),
             best_scales,
+            [get_op_name(module, m) for m in unscale_ops]
         )
 
     def _compute_best_scale(
