@@ -13,12 +13,34 @@ from awq.modules.fused.norm import FasterTransformerRMSNorm
 import copy
 import torch
 from torch import nn
+from dataclasses import dataclass
+from typing import Optional
 
 def set_skip_quant(a):
     setattr(a, "skip_quant", True)
     for m in a.modules():
         if isinstance(m, nn.Linear):
             setattr(m, "skip_quant", True)
+
+@dataclass
+class SplitConfig:
+    n_split_constant: Optional[int] = None
+    """Split each mlp into n_split_constant channels per layer"""
+    n_split_top_gt0_thresh: Optional[float] = None
+    """Split each mlp into channels with activation percentage greater than this value"""
+    n_split_bottom_gt0_thresh: Optional[float] = None
+    """Split each mlp into channels with activation percentage less than this value"""
+
+    random_cols: bool = False
+    """Randomly choose columns to split"""
+    top_gt0_cols:bool = False 
+    """Pick the top n_split columns with the highest activation percentage to split"""
+    bottom_gt0_cols: bool = False 
+    """Pick the bottom n_split columns with the highest activation percentage to split"""
+
+    def __post_init__(self):
+        assert sum([self.random_cols, self.top_gt0_cols, self.bottom_gt0_cols]) == 1, "Please specify only one of random_cols, top_gt0_cols or bottom_gt0_cols"
+        assert sum(a is not None for a in [self.n_split_constant, self.n_split_top_gt0_thresh]) == 1, "Please specify only one of n_split_constant or n_split_gt0_thresh"
 
 class LlamaAWQForCausalLM(BaseAWQForCausalLM):
     layer_type = "LlamaDecoderLayer"
@@ -46,20 +68,43 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
     def move_embed(model: OldLlamaForCausalLM, device: str):
         model.model.embed_tokens = model.model.embed_tokens.to(device)
 
-    def split_mlp(self, act_pcts, thresh):
+    def split_mlp(self, cfg: SplitConfig, act_pcts: torch.Tensor=None):
         assert not self.is_mlp_split, "MLP is already split?"
+        total_quantized = 0
+        total_full_prec = 0
         for i, module in enumerate(self.model.model.layers):
             assert isinstance(module.mlp, LlamaMLP)
-            num_past = (act_pcts[i] > thresh).sum()
-            if num_past > module.mlp.intermediate_size - 64:
-                print(f"Skipping quantization of mlp layer {i}")
-                set_skip_quant(module.mlp)
-            elif num_past < 64:
-                print(f"Fully quantizing mlp layer {i}")
+            if cfg.n_split_constant is not None:
+                assert cfg.n_split_constant % 128 == 0, "n_split_constant must be a multiple of 128"
+                n_split = cfg.n_split_constant
+            elif cfg.n_split_top_gt0_thresh is not None:
+                n_split = get_n_split_gt0_thresh(act_pcts[i], cfg.n_split_top_gt0_thresh)            
             else:
-                print(f"Quantizing ~{num_past} channels from mlp layer {i}")
-                module.mlp = SplitLlamaMLP(module.mlp, act_pcts[i], thresh)
+                raise ValueError("expected either n_split_constant or n_split_gt0_thresh")
+            total_quantized += n_split
+            total_full_prec += module.mlp.intermediate_size - n_split
+        
+            if n_split == 0:
+                print("Full quantizing mlp layer", i)
+                continue
+            elif n_split == module.mlp.intermediate_size:
+                print("Skipping quantization of mlp layer", i)
+                set_skip_quant(module.mlp)
+                continue
+
+            if cfg.random_cols:
+                s1inds, s2inds = split_inds_random(module.mlp.intermediate_size, n_split)
+            elif cfg.top_gt0_cols:
+                assert act_pcts is not None, "act_pcts must be provided for top_gt0_cols"
+                s1inds, s2inds = split_inds_gt0_threshold(act_pcts[i], n_split, top=True)
+            elif cfg.bottom_gt0_cols:
+                assert act_pcts is not None, "act_pcts must be provided for bottom_gt0_cols"
+                s2inds, s1inds = split_inds_gt0_threshold(act_pcts[i], n_split, top=False)
+
+            print(f"Quantizing {n_split} channels from mlp layer {i}")
+            module.mlp = SplitLlamaMLP(module.mlp, s1inds, s2inds)
         self.is_mlp_split = True
+        return total_quantized, total_full_prec
 
     @staticmethod
     def get_layers_for_scaling(module: OldLlamaDecoderLayer, input_feat, module_kwargs):
@@ -134,19 +179,28 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
         return layers
 
 
+def roundbase(x, base=128):
+    return int(base*round(x/base))
+
+def split_inds_random(intermediate_size, n_split):
+    perm = torch.randperm(intermediate_size)
+    return perm[:n_split], perm[n_split:]
+
+def split_inds_gt0_threshold(act_pcts, n_split, top=True):
+    perm = torch.argsort(act_pcts, descending=top)
+    return perm[:n_split], perm[n_split:]
+
+def get_n_split_gt0_thresh(act_pcts: torch.Tensor, thresh: float) -> int:
+    n_split = torch.argwhere(act_pcts > thresh).max()
+    n_split = roundbase(n_split, base=128)
+    return n_split
+
 class SplitLlamaMLP(nn.Module):
-    def __init__(self, mlp: LlamaMLP, act_pcts: torch.Tensor, thresh: float = 0.5):
+    def __init__(self, mlp: LlamaMLP, s1inds: torch.Tensor, s2inds: torch.Tensor):
         super().__init__()
         self.config = mlp.config
         self.hidden_size = mlp.hidden_size
         self.intermediate_size = mlp.intermediate_size
-
-        perm = torch.randperm(self.intermediate_size)
-        n_sig = torch.argwhere(act_pcts[perm] > thresh).max()
-        n_sig = min(max(n_sig, 128), self.intermediate_size - 128)
-        n_sig = ((n_sig + 127) // 128) * 128
-        s1inds = perm[:n_sig]
-        s2inds = perm[n_sig:]
 
         gate1_weight = mlp.gate_proj.weight[s1inds, :]
         gate2_weight = mlp.gate_proj.weight[s2inds, :]
@@ -156,9 +210,9 @@ class SplitLlamaMLP(nn.Module):
         down2_weight = mlp.down_proj.weight[:, s2inds]
 
         cfg1 = copy.deepcopy(mlp.config)
-        cfg1.intermediate_size = n_sig
+        cfg1.intermediate_size = len(s1inds)
         cfg2 = copy.deepcopy(mlp.config)
-        cfg2.intermediate_size = mlp.intermediate_size - n_sig
+        cfg2.intermediate_size = len(s2inds)
         self.mlp1 = LlamaMLP(cfg1).to(device=gate1_weight.device, dtype=gate1_weight.dtype)
         self.mlp2 = LlamaMLP(cfg2).to(device=gate2_weight.device, dtype=gate2_weight.dtype)
         self.mlp2.down_proj.bias = None # don't duplicate bias

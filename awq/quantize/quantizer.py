@@ -511,15 +511,10 @@ class AwqQuantizer:
 
     def _get_input_feat(self, layer, named_linears):
         # firstly, get input features of all linear layers
-        def cache_input_hook(m, x, y: torch.Tensor, name, feat_dict, out_dict: dict):
+        def cache_input_hook(m, x, y: torch.Tensor, name, feat_dict):
             x = x[0]
             x = x.detach().cpu()
             feat_dict[name].append(x)
-            #act_count = (y > 0).view(-1, y.shape[-1]).sum(dim=0)
-            #if name not in out_dict:
-            #    out_dict[name] = act_count
-            #else:
-            #    out_dict[name] += act_count
 
         input_feat = defaultdict(list)
         #output_feat = {}
@@ -535,7 +530,7 @@ class AwqQuantizer:
         for name in named_linears:
             handles.append(
                 named_linears[name].register_forward_hook(
-                    functools.partial(cache_input_hook, name=name, feat_dict=input_feat)#, out_dict=output_feat)
+                    functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
                 )
             )
         self.inps = self.inps.to(next(layer.parameters()).device)  # in case multi-gpu
