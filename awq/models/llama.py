@@ -51,8 +51,6 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
         for i, module in enumerate(self.model.model.layers):
             assert isinstance(module.mlp, LlamaMLP)
             num_past = (act_pcts[i] > thresh).sum()
-            #num_past = module.mlp.intermediate_size
-            #num_past = module.mlp.intermediate_size // 2
             if num_past > module.mlp.intermediate_size - 64:
                 print(f"Skipping quantization of mlp layer {i}")
                 set_skip_quant(module.mlp)
@@ -143,24 +141,24 @@ class SplitLlamaMLP(nn.Module):
         self.hidden_size = mlp.hidden_size
         self.intermediate_size = mlp.intermediate_size
 
-        perm = torch.argsort(act_pcts, descending=True)        
-        #perm = torch.randperm(self.intermediate_size)
-        limit = torch.argwhere(act_pcts[perm] > thresh).max()
-        limit = min(max(limit, 64), self.intermediate_size - 64)
-        #limit = self.intermediate_size // 2
-        limit = ((limit + 63) // 64) * 64
+        perm = torch.randperm(self.intermediate_size)
+        n_sig = torch.argwhere(act_pcts[perm] > thresh).max()
+        n_sig = min(max(n_sig, 128), self.intermediate_size - 128)
+        n_sig = ((n_sig + 127) // 128) * 128
+        s1inds = perm[:n_sig]
+        s2inds = perm[n_sig:]
 
-        gate1_weight = mlp.gate_proj.weight[perm[:limit], :]
-        gate2_weight = mlp.gate_proj.weight[perm[limit:], :]
-        up1_weight = mlp.up_proj.weight[perm[:limit], :]
-        up2_weight = mlp.up_proj.weight[perm[limit:], :]
-        down1_weight = mlp.down_proj.weight[:, perm[:limit]]
-        down2_weight = mlp.down_proj.weight[:, perm[limit:]]
+        gate1_weight = mlp.gate_proj.weight[s1inds, :]
+        gate2_weight = mlp.gate_proj.weight[s2inds, :]
+        up1_weight = mlp.up_proj.weight[s1inds, :]
+        up2_weight = mlp.up_proj.weight[s2inds, :]
+        down1_weight = mlp.down_proj.weight[:, s1inds]
+        down2_weight = mlp.down_proj.weight[:, s2inds]
 
         cfg1 = copy.deepcopy(mlp.config)
-        cfg1.intermediate_size = limit
+        cfg1.intermediate_size = n_sig
         cfg2 = copy.deepcopy(mlp.config)
-        cfg2.intermediate_size = mlp.intermediate_size - limit
+        cfg2.intermediate_size = mlp.intermediate_size - n_sig
         self.mlp1 = LlamaMLP(cfg1).to(device=gate1_weight.device, dtype=gate1_weight.dtype)
         self.mlp2 = LlamaMLP(cfg2).to(device=gate2_weight.device, dtype=gate2_weight.dtype)
         self.mlp2.down_proj.bias = None # don't duplicate bias
@@ -173,10 +171,10 @@ class SplitLlamaMLP(nn.Module):
         self.mlp1.down_proj.weight.data.copy_(down1_weight)
         self.mlp2.down_proj.weight.data.copy_(down2_weight)
         if mlp.gate_proj.bias is not None:
-            self.mlp1.gate_proj.bias.data.copy_(mlp.gate_proj.bias[perm[:limit]])
-            self.mlp2.gate_proj.bias.data.copy_(mlp.gate_proj.bias[perm[limit:]])
-            self.mlp1.up_proj.bias.data.copy_(mlp.up_proj.bias[perm[:limit]])
-            self.mlp2.up_proj.bias.data.copy_(mlp.up_proj.bias[perm[limit:]])
+            self.mlp1.gate_proj.bias.data.copy_(mlp.gate_proj.bias[s1inds])
+            self.mlp2.gate_proj.bias.data.copy_(mlp.gate_proj.bias[s2inds])
+            self.mlp1.up_proj.bias.data.copy_(mlp.up_proj.bias[s1inds])
+            self.mlp2.up_proj.bias.data.copy_(mlp.up_proj.bias[s2inds])
             self.mlp1.down_proj.bias.data.copy_(mlp.down_proj.bias)
 
     def forward(self, x):
