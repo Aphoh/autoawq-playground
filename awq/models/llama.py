@@ -76,7 +76,7 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
         for i, module in enumerate(self.model.model.layers):
             assert isinstance(module.mlp, LlamaMLP)
             if cfg.n_split_constant is not None:
-                assert cfg.n_split_constant % 128 == 0, "n_split_constant must be a multiple of 128"
+                assert cfg.n_split_constant % 64 == 0, "n_split_constant must be a multiple of 64"
                 n_split = cfg.n_split_constant
             elif cfg.n_split_top_thresh is not None:
                 n_split = get_n_split_thresh(split_metric[i], cfg.n_split_top_thresh)
@@ -182,7 +182,7 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
         return layers
 
 
-def roundbase(x, base=128):
+def roundbase(x, base=64):
     if isinstance(x, torch.Tensor):
         x = x.item()
     return int(round(base*round(x/base)))
@@ -197,7 +197,7 @@ def split_inds_threshold(split_metric, n_split, top=True):
 
 def get_n_split_thresh(split_metric: torch.Tensor, thresh: float) -> int:
     n_split = torch.sum(split_metric > thresh)
-    n_split = roundbase(n_split, base=128)
+    n_split = roundbase(n_split, base=64)
     return n_split
 
 class SplitLlamaMLP(nn.Module):
