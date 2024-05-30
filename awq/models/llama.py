@@ -25,11 +25,11 @@ def set_skip_quant(a):
 @dataclass
 class SplitConfig:
     n_split_constant: Optional[int] = None
-    """Split each mlp into n_split_constant channels per layer"""
+    """quantize n_split_constant channels per layer"""
     n_split_top_thresh: Optional[float] = None
-    """Split each mlp into channels with activation percentage greater than this value"""
+    """don't quantize the # of channels with the metric greater than this value"""
     n_split_bottom_thresh: Optional[float] = None
-    """Split each mlp into channels with activation percentage less than this value"""
+    """don't quantize the # of channels with the metric less than this value"""
 
     random_cols: bool = False
     """Randomly choose columns to split"""
@@ -40,7 +40,7 @@ class SplitConfig:
 
     def __post_init__(self):
         assert sum([self.random_cols, self.top_cols, self.bottom_cols]) == 1, "Please specify only one of random_cols, top_cols or bottom_cols"
-        assert sum(a is not None for a in [self.n_split_constant, self.n_split_top_thresh]) == 1, "Please specify only one of n_split_constant or n_split_gt0_thresh"
+        assert sum(a is not None for a in [self.n_split_constant, self.n_split_top_thresh, self.n_split_bottom_thresh]) == 1, "Please specify only one of the n_split variables"
 
 class LlamaAWQForCausalLM(BaseAWQForCausalLM):
     layer_type = "LlamaDecoderLayer"
@@ -77,35 +77,39 @@ class LlamaAWQForCausalLM(BaseAWQForCausalLM):
             assert isinstance(module.mlp, LlamaMLP)
             if cfg.n_split_constant is not None:
                 assert cfg.n_split_constant % 64 == 0, "n_split_constant must be a multiple of 64"
-                n_split = cfg.n_split_constant
+                n_quant = cfg.n_split_constant
             elif cfg.n_split_top_thresh is not None:
-                n_split = get_n_split_thresh(split_metric[i], cfg.n_split_top_thresh)
+                n_quant = get_n_quant(split_metric[i] < cfg.n_split_top_thresh) # count the number of channels with metric < threshold
             elif cfg.n_split_bottom_thresh is not None:
-                n_split = get_n_split_thresh(split_metric[i], cfg.n_split_bottom_thresh)
+                n_quant = get_n_quant(split_metric[i] > cfg.n_split_bottom_thresh) # count the number of channels with metric > threshold
             else:
                 raise ValueError("expected either n_split_constant or n_split_gt0_thresh")
-            non_quant_counts.append(n_split)
-            quantized_counts.append(module.mlp.intermediate_size - n_split)
+            quantized_counts.append(n_quant)
+            non_quant_counts.append(module.mlp.intermediate_size - n_quant)
 
-            if n_split == 0:
+            if n_quant == module.mlp.intermediate_size:
                 print("Full quantizing mlp layer", i)
                 continue
-            elif n_split == module.mlp.intermediate_size:
+            elif n_quant == 0:
                 print("Skipping quantization of mlp layer", i)
                 set_skip_quant(module.mlp)
                 continue
 
             if cfg.random_cols:
-                s1inds, s2inds = split_inds_random(module.mlp.intermediate_size, n_split)
+                quant_inds, non_quant_inds = split_inds_random(module.mlp.intermediate_size, n_quant)
             elif cfg.top_cols:
                 assert split_metric is not None, "split_metric must be provided for top_cols"
-                s1inds, s2inds = split_inds_threshold(split_metric[i], n_split, top=True)
+                quant_inds, non_quant_inds = split_inds_threshold(split_metric[i], n_quant, top=True)
             elif cfg.bottom_cols:
                 assert split_metric is not None, "split_metric must be provided for bottom_cols"
-                s2inds, s1inds = split_inds_threshold(split_metric[i], n_split, top=False)
+                quant_inds, non_quant_inds = split_inds_threshold(split_metric[i], n_quant, top=False)
 
-            print(f"Quantizing {n_split} channels from mlp layer {i}")
-            module.mlp = SplitLlamaMLP(module.mlp, s1inds, s2inds)
+            assert len(quant_inds) == n_quant
+            assert len(non_quant_inds) == module.mlp.intermediate_size - n_quant
+
+            print(f"Quantizing {n_quant} channels from mlp layer {i}")
+            # MLP 2 gets quantized, MLP 1 is not quantized
+            module.mlp = SplitLlamaMLP(module.mlp, non_quant_inds, quant_inds) 
         self.is_mlp_split = True
         return quantized_counts, non_quant_counts
 
@@ -187,16 +191,18 @@ def roundbase(x, base=64):
         x = x.item()
     return int(round(base*round(x/base)))
 
-def split_inds_random(intermediate_size, n_split):
+def split_inds_random(intermediate_size, n_quant):
     perm = torch.randperm(intermediate_size)
-    return perm[:n_split], perm[n_split:]
+    return perm[:n_quant], perm[n_quant:]
 
-def split_inds_threshold(split_metric, n_split, top=True):
+def split_inds_threshold(split_metric, n_quant, top=True):
     perm = torch.argsort(split_metric, descending=top)
-    return perm[:n_split], perm[n_split:]
+    return perm[:n_quant], perm[n_quant:]
 
-def get_n_split_thresh(split_metric: torch.Tensor, thresh: float) -> int:
-    n_split = torch.sum(split_metric > thresh)
+def get_n_quant(should_quantize: torch.Tensor) -> int:
+    # input should be a bool tensor
+    assert should_quantize.dtype == torch.bool
+    n_split = torch.sum(should_quantize)
     n_split = roundbase(n_split, base=64)
     return n_split
 
